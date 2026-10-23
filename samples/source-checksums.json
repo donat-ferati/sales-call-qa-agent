@@ -1,0 +1,72 @@
+[
+  {
+    "path": "samples/branch-hours-complete.wav",
+    "sha256": "a4722b01842b748fce26fa9be5de1829dcf2132497115c7be1115ddd0ef6e295",
+    "bytes": 1727118
+  },
+  {
+    "path": "samples/branch-hours-truncated-demo.wav",
+    "sha256": "e28dc937f2490efe7de782c2a1cea0124a1da1264f248678fdd58863dc27cd0a",
+    "bytes": 640078
+  },
+  {
+    "path": "samples/card-replacement-missing-next-step.wav",
+    "sha256": "75e2988982184cdd2434423925231ac0dfec2b3f5c5878acbe59c2952f5e4832",
+    "bytes": 1635630
+  },
+  {
+    "path": "samples/LICENSE-CC-BY-4.0.txt",
+    "sha256": "9e5f1b3c610b9c2da5c313bf81d577a7d1acec686bdb0384edefa6df0f90cd94",
+    "bytes": 18656
+  },
+  {
+    "path": "samples/source/0002f70f7386445b-agent.wav",
+    "sha256": "a6bff589d63b9502ebf28fa3f57bd98b2624174336ba11c5e558640516385131",
+    "bytes": 785038
+  },
+  {
+    "path": "samples/source/0002f70f7386445b-caller.wav",
+    "sha256": "56fa38878fee9e1dd2b63289a6ef8075e0c9df9eb8059f49b543bda67de008f0",
+    "bytes": 817838
+  },
+  {
+    "path": "samples/source/0002f70f7386445b-metadata.json",
+    "sha256": "3e833d15d30ae3f33c882fad37a87a3794b08f7c5aed3b40fbe172ad310abd50",
+    "bytes": 1567
+  },
+  {
+    "path": "samples/source/0002f70f7386445b-reference.json",
+    "sha256": "3795cc8c4e733a5280be7d2a4f00378dfce7d542f1cb19454d30dd44f7728559",
+    "bytes": 14440
+  },
+  {
+    "path": "samples/source/alignment.json",
+    "sha256": "1d198067499e7fcec9581bbf935354b3ebbb2903cc018ac92a49e859f2ec5d1d",
+    "bytes": 304
+  },
+  {
+    "path": "samples/source/ff0296d00e5e4184-agent.wav",
+    "sha256": "479cbe955fdb61b61b723dad2f45acfffdebdc768cee83108a926e1a20f38780",
+    "bytes": 831598
+  },
+  {
+    "path": "samples/source/ff0296d00e5e4184-caller.wav",
+    "sha256": "e27c63b1b1b47f5d54bf2f59309991f7fa97890255cec9494a9cc7a58ebd21b5",
+    "bytes": 863598
+  },
+  {
+    "path": "samples/source/ff0296d00e5e4184-metadata.json",
+    "sha256": "573b700997b8d71061b93229b2c917aff9e6011e1faac93765b9b46a8f82d3a8",
+    "bytes": 1424
+  },
+  {
+    "path": "samples/source/ff0296d00e5e4184-reference.json",
+    "sha256": "31fcfefa7eb9e47a7599949633672e62261c5de02d55644867a69e74c9972c0c",
+    "bytes": 10116
+  },
+  {
+    "path": "samples/source/README-upstream.md",
+    "sha256": "a337578b7f230e5bbc1ab19750e549690f2a206faff741ea042a55c63e997729",
+    "bytes": 8852
+  }
+]

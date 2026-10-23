@@ -1,0 +1,14 @@
+[
+  {
+    "output": "branch-hours-complete.wav",
+    "agent_delay_ms": 2000,
+    "caller_delay_ms": 0,
+    "call": "ff0296d00e5e4184"
+  },
+  {
+    "output": "card-replacement-missing-next-step.wav",
+    "agent_delay_ms": 2051,
+    "caller_delay_ms": 0,
+    "call": "0002f70f7386445b"
+  }
+]
