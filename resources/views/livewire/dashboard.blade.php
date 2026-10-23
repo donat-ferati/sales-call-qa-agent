@@ -12,7 +12,7 @@
                 <p class="mt-2 text-2xl font-semibold tabular-nums">{{ number_format($totals[$key]) }}</p></div>
         @endforeach
         <div class="px-5 py-5"><p class="text-xs font-medium text-slate-500">Average reviewed score</p>
-            <p class="mt-2 text-2xl font-semibold tabular-nums">{{ $totals['reviewed_score'] !== null ? number_format($totals['reviewed_score'], 1).'%' : '—' }}</p>
+            <p class="mt-2 text-2xl font-semibold tabular-nums">{{ $totals['reviewed_score'] !== null ? number_format($totals['reviewed_score'], 2).'%' : '—' }}</p>
         </div>
     </section>
     @if($totals['review_pending'])
@@ -51,7 +51,7 @@
                                 <x:badge :value="$evaluation->status"/>
                             </x:table.cell>
                             <x:table.cell class="tabular-nums"><span
-                                    class="font-medium">{{ $evaluation->final_score !== null ? number_format($evaluation->final_score, 1).'%' : '—' }}</span>
+                                    class="font-medium">{{ $evaluation->final_score !== null ? number_format($evaluation->final_score, 2).'%' : '—' }}</span>
                                 @if($evaluation->status === 'completed')
                                     <p class="mt-1 text-xs text-slate-500">{{ $evaluation->review_status === 'reviewed' ? 'Reviewed' : 'Review pending' }}</p>
                                 @endif</x:table.cell>

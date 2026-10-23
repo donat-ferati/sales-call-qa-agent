@@ -13,7 +13,7 @@
         @if($score !== null)
             Resolved applicable criteria
         @elseif($provisional !== null)
-            Provisional · {{ number_format($coverage, 0) }}% weight resolved
+            Provisional · {{ number_format($coverage, 2) }}% weight resolved
         @else
             No resolved applicable criteria
         @endif
