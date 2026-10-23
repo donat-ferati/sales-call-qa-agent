@@ -6,6 +6,7 @@ use App\Jobs\EvaluateCall;
 use App\Jobs\TranscribeCall;
 use App\Models\Evaluation;
 use App\Models\EvaluationRun;
+use App\Services\ProcessingWorkspaces;
 use App\Services\Uploads\RecoverUploadBatches;
 use App\Services\WindowedEvaluationWorkflow;
 use Illuminate\Console\Command;
@@ -17,14 +18,14 @@ final class RecoverProcessing extends Command
 
     protected $description = 'Recover interrupted evaluation steps, upload imports, and abandoned transcription attempts.';
 
-    public function handle(WindowedEvaluationWorkflow $workflow, RecoverUploadBatches $uploads): int
+    public function handle(WindowedEvaluationWorkflow $workflow, RecoverUploadBatches $uploads, ProcessingWorkspaces $workspaces): int
     {
         $count = 0;
         Evaluation::whereIn('status', ['queued', 'evaluating'])->whereIn('id', EvaluationRun::select('evaluation_id')->where('status', 'running'))->eachById(function ($evaluation) use ($workflow, &$count)
         {
             $count += (int) $workflow->recover($evaluation);
         });
-        Evaluation::where('status', 'queued')->whereNotIn('id', EvaluationRun::select('evaluation_id'))->eachById(function ($evaluation) use (&$count)
+        Evaluation::where('status', 'queued')->whereNotIn('id', EvaluationRun::select('evaluation_id')->where('status', 'running'))->eachById(function ($evaluation) use (&$count)
         {
             if ($evaluation->call->segments()->exists())
             {
@@ -52,7 +53,8 @@ final class RecoverProcessing extends Command
             });
         });
         $imports = $uploads->handle();
-        $this->info('Recovered '.$count.' evaluation/transcription tasks and '.$imports.' upload batches. Completed transcripts and checkpoints were retained.');
+        $removed = $workspaces->cleanup();
+        $this->info('Recovered '.$count.' evaluation/transcription tasks and '.$imports.' upload batches; removed '.$removed.' abandoned processing workspaces. Completed transcripts and checkpoints were retained.');
 
         return self::SUCCESS;
     }

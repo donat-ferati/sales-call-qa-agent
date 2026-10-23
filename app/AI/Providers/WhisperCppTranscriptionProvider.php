@@ -7,10 +7,10 @@ use App\AI\Contracts\TranscriptionProvider;
 use App\AI\Data\TranscriptionResult;
 use App\AI\Exceptions\ProcessingException;
 use App\AI\TranscriptionNormalizer;
+use App\Services\ProcessingWorkspaces;
 use Illuminate\Contracts\Config\Repository;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Process\Factory;
-use Illuminate\Support\Str;
 use JsonException;
 use Throwable;
 
@@ -22,6 +22,7 @@ final class WhisperCppTranscriptionProvider implements TranscriptionProvider
         private Factory $process,
         private Filesystem $files,
         private Repository $config,
+        private ProcessingWorkspaces $workspaces,
     ) {
     }
 
@@ -40,8 +41,7 @@ final class WhisperCppTranscriptionProvider implements TranscriptionProvider
             }
         }
 
-        $directory = storage_path('app/private/processing/'.Str::uuid());
-        $this->files->ensureDirectoryExists($directory);
+        $directory = $this->workspaces->create($absoluteAudioPath);
         $prepared = $directory.'/audio.wav';
         $output = $directory.'/transcript';
         $started = microtime(true);
@@ -104,7 +104,7 @@ final class WhisperCppTranscriptionProvider implements TranscriptionProvider
         }
         finally
         {
-            $this->files->deleteDirectory($directory);
+            $this->workspaces->remove($directory);
         }
     }
 }

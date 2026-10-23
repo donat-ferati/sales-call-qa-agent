@@ -4,6 +4,7 @@ namespace App\Console\Commands;
 
 use App\Models\CallRecording;
 use App\Models\Evaluation;
+use App\Services\ProcessingWorkspaces;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
@@ -15,7 +16,7 @@ final class PruneRecordings extends Command
 
     protected $description = 'Preview or execute opt-in recording retention; disabled unless QA_RETENTION_DAYS is positive.';
 
-    public function handle(): int
+    public function handle(ProcessingWorkspaces $workspaces): int
     {
         $days = config('qa.retention_days');
 
@@ -60,6 +61,9 @@ final class PruneRecordings extends Command
                     $this->error('Recording '.$candidate->id.' was not pruned. Check private storage and retry; its database history is retained.');
                 }
             });
+
+            $removed = $workspaces->cleanup();
+            $this->info('Removed '.$removed.' abandoned processing workspaces.');
 
             if ($failed)
             {
