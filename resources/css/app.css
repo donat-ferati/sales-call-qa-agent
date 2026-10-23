@@ -1,0 +1,26 @@
+@import 'tailwindcss';
+@source '../../vendor/laravel/framework/src/Illuminate/Pagination/resources/views/*.blade.php';
+@source '../../storage/framework/views/*.php';
+@source '../**/*.blade.php';
+@source '../**/*.js';
+
+@font-face { font-family: 'Instrument Sans'; font-style: normal; font-weight: 400; font-display: swap; src: url('../fonts/instrument-sans-400.ttf') format('truetype'); }
+@font-face { font-family: 'Instrument Sans'; font-style: normal; font-weight: 500; font-display: swap; src: url('../fonts/instrument-sans-500.ttf') format('truetype'); }
+@font-face { font-family: 'Instrument Sans'; font-style: normal; font-weight: 600; font-display: swap; src: url('../fonts/instrument-sans-600.ttf') format('truetype'); }
+@font-face { font-family: 'Instrument Sans'; font-style: normal; font-weight: 700; font-display: swap; src: url('../fonts/instrument-sans-700.ttf') format('truetype'); }
+
+@theme {
+    --font-sans: 'Instrument Sans', ui-sans-serif, system-ui, sans-serif;
+}
+
+@layer base {
+    [x-cloak] { display: none !important; }
+    body { @apply bg-slate-50 text-slate-900 antialiased; }
+    button, a, input, select, textarea { @apply focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700; }
+    button:not(:disabled), select { cursor: pointer; }
+    ::selection { @apply bg-teal-200 text-teal-950; }
+    input, textarea { caret-color: var(--color-teal-700); }
+    h1, h2, h3 { text-wrap: balance; }
+    audio { width: 100%; }
+    * { scrollbar-color: var(--color-slate-300) transparent; scrollbar-width: thin; }
+}
