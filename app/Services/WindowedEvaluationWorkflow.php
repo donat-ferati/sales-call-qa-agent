@@ -3,11 +3,13 @@
 namespace App\Services;
 
 use App\Actions\PersistEvaluation;
+use App\AI\CheckpointCompatibility;
+use App\AI\Contracts\EvaluationProvider;
 use App\AI\Data\EvaluationResult;
 use App\AI\Exceptions\MemoryExhaustedException;
 use App\AI\Exceptions\ProcessingException;
 use App\AI\Exceptions\TransientEvaluationException;
-use App\AI\WindowedEvaluator;
+use App\AI\TranscriptWindowOrder;
 use App\Jobs\EvaluateCall;
 use App\Models\Evaluation;
 use App\Models\EvaluationRun;
@@ -18,11 +20,13 @@ use Throwable;
 
 final class WindowedEvaluationWorkflow
 {
-    private const PROMPT_VERSION = 'qa-windowed-v2';
+    private const PROMPT_VERSION = 'qa-windowed-v3';
 
     public function __construct(
-        private WindowedEvaluator $provider,
+        private EvaluationProvider $provider,
         private PersistEvaluation $persist,
+        private CheckpointCompatibility $checkpoints,
+        private TranscriptWindowOrder $windowOrder,
     ) {
     }
 
@@ -61,11 +65,20 @@ final class WindowedEvaluationWorkflow
                 $output = $this->provider->inspect($criteria, $step->payload['spans'], $context, $step->context_tokens);
                 $saved = ['observations' => $output->observations, 'metadata' => $output->metadata];
             }
+            elseif ($step->kind === 'reduce')
+            {
+                $criterion = collect($run->criteria_snapshot)->firstWhere('id', $step->criterion_ids[0]);
+                $context = $this->reconciliationContext($run, $criterion);
+                $output = $this->provider->reduce($criterion, $step->payload['nodes'], $run->segments_snapshot, $context, $step->context_tokens);
+                $saved = ['observations' => $output->observations, 'metadata' => $output->metadata];
+            }
             else
             {
                 $criterion = collect($run->criteria_snapshot)->firstWhere('id', $step->criterion_ids[0]);
-                $findings = $this->findings($run, $criterion['id']);
-                $output = $this->provider->reconcile($criterion, $findings, $run->segments_snapshot, $context, $step->context_tokens);
+                $context = $this->reconciliationContext($run, $criterion);
+                $output = isset($step->payload['nodes'])
+                    ? $this->provider->reconcileNodes($criterion, $step->payload['nodes'], $run->segments_snapshot, $context, $step->context_tokens)
+                    : $this->provider->reconcileNodes($criterion, $this->provider->reconciliationNodes($criterion, $this->findings($run, $criterion['id']), $run->segments_snapshot, $context), $run->segments_snapshot, $context, $step->context_tokens);
                 $saved = ['results' => $output->results, 'metadata' => $output->metadata];
             }
             DB::transaction(function () use ($evaluationId, $run, $step, $saved, &$checkpointCommitted)
@@ -144,7 +157,7 @@ final class WindowedEvaluationWorkflow
             throw new ProcessingException('Evaluation requires a saved transcript and published criteria.');
         }
         $digest = $this->provider->modelDigest();
-        $context = ['is_complete' => $evaluation->call->is_complete, 'duration' => $evaluation->call->duration, 'call_id' => $evaluation->call->id];
+        $context = ['is_complete' => $evaluation->call->is_complete, 'duration' => $evaluation->call->duration, 'call_id' => $evaluation->call->id, 'evaluation_provider' => $this->provider::class];
         $sourceHashes = [];
 
         foreach (new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator(app_path('AI'), \FilesystemIterator::SKIP_DOTS)) as $source)
@@ -163,6 +176,11 @@ final class WindowedEvaluationWorkflow
             $evaluation = Evaluation::query()->lockForUpdate()->findOrFail($evaluation->id);
             EvaluationRun::where('evaluation_id', $evaluation->id)->where('fingerprint', '!=', $fingerprint)->whereIn('status', ['running', 'failed'])->update(['status' => 'superseded']);
             $run = EvaluationRun::firstOrCreate(['evaluation_id' => $evaluation->id, 'fingerprint' => $fingerprint], ['model_digest' => $digest, 'prompt_version' => self::PROMPT_VERSION, 'criteria_snapshot' => $criteria, 'segments_snapshot' => $segments, 'context' => $context, 'context_tokens' => 16384, 'plan_revision' => 1, 'status' => 'running']);
+
+            if ($run->wasRecentlyCreated)
+            {
+                $this->reuseCheckpoints($run);
+            }
 
             if (in_array($run->status, ['failed', 'superseded'], true))
             {
@@ -195,7 +213,10 @@ final class WindowedEvaluationWorkflow
 
                 if ($remaining !== [])
                 {
-                    array_push($plans, ...$this->provider->plan([$criterion], $remaining, $this->context($run), $run->context_tokens));
+                    foreach ($this->windowOrder->groups($remaining, $run->segments_snapshot) as $group)
+                    {
+                        array_push($plans, ...$this->provider->plan([$criterion], $group, $this->context($run), $run->context_tokens));
+                    }
                 }
             }
         }
@@ -210,11 +231,107 @@ final class WindowedEvaluationWorkflow
         }
         foreach ($run->criteria_snapshot as $criterion)
         {
-            if (!$run->steps()->where('kind', 'reconcile')->where('status', 'completed')->get()->contains(fn ($step) => $step->criterion_ids === [$criterion['id']]))
+            if ($run->steps()->where('kind', 'reconcile')->where('status', 'completed')->get()->contains(fn ($step) => $step->criterion_ids === [$criterion['id']]))
             {
-                $this->createStep($run, 'reconcile', [$criterion['id']], ['criterion_id' => $criterion['id']]);
+                continue;
+            }
+
+            $context = $this->context($run);
+            $nodes = $this->provider->reconciliationNodes($criterion, $this->findings($run, $criterion['id']), $run->segments_snapshot, $context);
+            $context['reconciliation_source_ids'] = array_column($nodes, 'id');
+            $frontier = $this->reconciliationFrontier($run, $criterion['id'], $nodes);
+            $plan = $this->provider->planReconciliation($criterion, $frontier, $run->segments_snapshot, $context, $run->context_tokens);
+
+            if ($plan['kind'] === 'reconcile')
+            {
+                $this->createStep($run, 'reconcile', [$criterion['id']], ['criterion_id' => $criterion['id'], 'nodes' => $plan['nodes']]);
+
+                continue;
+            }
+
+            foreach ($plan['batches'] as $batch)
+            {
+                $this->createStep($run, 'reduce', [$criterion['id']], ['criterion_id' => $criterion['id'], 'nodes' => $batch]);
             }
         }
+    }
+
+    private function reuseCheckpoints(EvaluationRun $target): void
+    {
+        $sources = EvaluationRun::where('evaluation_id', $target->evaluation_id)->whereKeyNot($target->id)->latest('id')->get();
+
+        foreach ($sources as $source)
+        {
+            if (!$this->checkpoints->sameInputs($source, $target))
+            {
+                continue;
+            }
+
+            foreach ($source->steps()->where('kind', 'window')->where('status', 'completed')->get() as $step)
+            {
+                if ($this->checkpoints->window($step, $source, $target))
+                {
+                    $this->copyCheckpoint($target, $step);
+                }
+            }
+
+            foreach ($source->steps()->where('kind', 'reconcile')->where('status', 'completed')->get() as $step)
+            {
+                $criterionId = $step->criterion_ids[0];
+
+                if ($this->checkpoints->reconciliation($step, $source, $target, $this->findings($target, $criterionId), $this->context($target)))
+                {
+                    $this->copyCheckpoint($target, $step);
+                }
+            }
+
+            return;
+        }
+    }
+
+    private function copyCheckpoint(EvaluationRun $target, EvaluationStep $source): void
+    {
+        $output = $source->output;
+        $output['metadata'] = [...$output['metadata'], 'reused_from_step_id' => $source->id, 'reused_from_run_id' => $source->evaluation_run_id];
+        $target->steps()->firstOrCreate(['step_key' => $source->step_key], [
+            'kind' => $source->kind, 'status' => 'completed', 'plan_revision' => $target->plan_revision,
+            'context_tokens' => $source->context_tokens, 'criterion_ids' => $source->criterion_ids,
+            'payload' => $source->payload, 'output' => $output, 'attempts' => 0,
+            'started_at' => $source->started_at, 'completed_at' => $source->completed_at,
+        ]);
+    }
+
+    private function reconciliationContext(EvaluationRun $run, array $criterion): array
+    {
+        $context = $this->context($run);
+        $nodes = $this->provider->reconciliationNodes($criterion, $this->findings($run, $criterion['id']), $run->segments_snapshot, $context);
+
+        return [...$context, 'reconciliation_source_ids' => array_column($nodes, 'id')];
+    }
+
+    private function reconciliationFrontier(EvaluationRun $run, int $criterionId, array $nodes): array
+    {
+        foreach ($run->steps()->where('kind', 'reduce')->where('status', 'completed')->get() as $step)
+        {
+            if ($step->criterion_ids !== [$criterionId])
+            {
+                continue;
+            }
+
+            $node = $this->provider->nodeFromReduction($step->output);
+            $children = $node['child_ids'];
+            $ids = array_column($nodes, 'id');
+            $offset = array_search($children[0], $ids, true);
+
+            if ($offset === false || array_slice($ids, $offset, count($children)) !== $children)
+            {
+                throw new ProcessingException('Saved reconciliation batches do not match the chronological source ledger. No score was saved.');
+            }
+
+            array_splice($nodes, $offset, count($children), [$node]);
+        }
+
+        return $nodes;
     }
 
     private function createStep(EvaluationRun $run, string $kind, array $criterionIds, array $payload): void
@@ -317,7 +434,16 @@ final class WindowedEvaluationWorkflow
 
     private function findings(EvaluationRun $run, int $criterionId): array
     {
-        return $run->steps()->where('kind', 'window')->where('status', 'completed')->get()->filter(fn ($step) => in_array($criterionId, $step->criterion_ids, true))->map(fn ($step) => $step->output)->values()->all();
+        $records = $run->steps()->where('kind', 'window')->where('status', 'completed')->get()->filter(fn ($step) => in_array($criterionId, $step->criterion_ids, true))->map(function ($step)
+        {
+            $output = $step->output;
+            $spans = array_map(fn (array $span) => ['segment_id' => $span['id'], 'text_start' => $span['text_start'], 'text_end' => $span['text_end'], 'overlap' => $span['overlap']], $step->payload['spans']);
+            $output['metadata'] = [...$output['metadata'], 'source_step_key' => $step->step_key, 'analyzed_spans' => $spans];
+
+            return $output;
+        })->values()->all();
+
+        return $this->windowOrder->sort($records, $run->segments_snapshot);
     }
 
     private function downgrade(int $evaluationId, EvaluationRun $run, EvaluationStep $step, string $message): void
@@ -380,7 +506,7 @@ final class WindowedEvaluationWorkflow
             throw new ProcessingException('Whole-call reconciliation is incomplete. Saved checkpoints are intact.');
         }
         $completed = $run->steps()->where('status', 'completed')->get();
-        $metadata = ['provider' => 'ollama-windowed', 'model' => config('qa.ollama.model'), 'model_digest' => $run->model_digest, 'prompt_version' => self::PROMPT_VERSION, 'evaluation_run_id' => $run->id, 'context_tokens' => $run->context_tokens, 'plan_revisions' => $run->plan_revision, 'windows_completed' => $completed->where('kind', 'window')->count(), 'reconciliations_completed' => $steps->count(), 'thinking' => false, 'elapsed_seconds' => round($completed->sum(fn ($step) => $step->output['metadata']['elapsed_seconds'] ?? 0), 3), 'steps' => $completed->map(fn ($step) => ['id' => $step->id, 'kind' => $step->kind, 'context_tokens' => $step->context_tokens, 'metadata' => $step->output['metadata']])->all()];
+        $metadata = ['evaluation_provider' => $this->provider::class, ...array_intersect_key($completed->last()->output['metadata'], array_flip(['provider', 'model'])), 'model_digest' => $run->model_digest, 'prompt_version' => self::PROMPT_VERSION, 'evaluation_run_id' => $run->id, 'context_tokens' => $run->context_tokens, 'plan_revisions' => $run->plan_revision, 'windows_completed' => $completed->where('kind', 'window')->count(), 'reduction_batches_completed' => $completed->where('kind', 'reduce')->count(), 'reused_checkpoints' => $completed->filter(fn ($step) => isset($step->output['metadata']['reused_from_step_id']))->count(), 'reconciliations_completed' => $steps->count(), 'thinking' => false, 'elapsed_seconds' => round($completed->sum(fn ($step) => $step->output['metadata']['elapsed_seconds'] ?? 0), 3), 'steps' => $completed->map(fn ($step) => ['id' => $step->id, 'kind' => $step->kind, 'context_tokens' => $step->context_tokens, 'metadata' => $step->output['metadata']])->all()];
         DB::transaction(function () use ($evaluationId, $run, $results, $metadata)
         {
             $evaluation = Evaluation::query()->lockForUpdate()->findOrFail($evaluationId);
@@ -412,11 +538,17 @@ final class WindowedEvaluationWorkflow
         $total = $windows->count();
         $phase = $total === 0 ? 'planning' : ($completed < $total ? 'windows' : 'reconciling');
         $reconciled = $steps->where('kind', 'reconcile')->where('status', 'completed')->count();
+        $reductions = $steps->where('kind', 'reduce');
+        $combined = $reductions->where('status', 'completed')->count();
+        $active = $steps->firstWhere('status', 'running');
+        $combining = $active ? $active->kind === 'reduce' : $reductions->where('status', 'pending')->isNotEmpty();
         $message = match ($phase)
         {
             'planning' => 'Preparing bounded context windows.',
             'windows' => 'Analysing window '.min($completed + 1, $total).' of '.$total.'.',
-            default => 'Reconciling whole-call criterion '.min($reconciled + 1, count($run->criteria_snapshot)).' of '.count($run->criteria_snapshot).'.',
+            default => $combining
+                ? 'Combining evidence batch '.min($combined + 1, $reductions->count()).' of '.$reductions->count().'.'
+                : 'Reconciling whole-call criterion '.min($reconciled + 1, count($run->criteria_snapshot)).' of '.count($run->criteria_snapshot).'.',
         };
 
         return compact('phase', 'completed', 'total', 'message') + ['context_tokens' => $run->context_tokens];

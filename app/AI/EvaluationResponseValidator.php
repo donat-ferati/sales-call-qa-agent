@@ -60,17 +60,35 @@ final class EvaluationResponseValidator
                 throw new ProcessingException('The evaluator returned an invalid evidence list. No score was saved.');
             }
 
+            $references = [];
+            $roles = [];
+
             foreach ($result['evidence'] as $evidence)
             {
                 if (!is_int($evidence['segment_id']))
                 {
                     throw new ProcessingException('The evaluator returned an invalid evidence identifier. No score was saved.');
                 }
+                $reference = $evidence['segment_id'].':'.$evidence['role'];
+
+                if (isset($references[$reference]))
+                {
+                    throw new ProcessingException('The evaluator returned duplicate evidence references. No score was saved.');
+                }
+                $references[$reference] = true;
+                $roles[] = $evidence['role'];
             }
 
-            if (in_array($result['evidence_basis'], ['positive', 'contradictory'], true) && $result['evidence'] === [])
+            $requiredRole = match ($result['evidence_basis'])
             {
-                throw new ProcessingException('The evaluator claimed evidence without identifying a transcript segment. No score was saved.');
+                'positive' => 'supporting',
+                'contradictory' => 'contradicting',
+                default => null,
+            };
+
+            if ($requiredRole !== null && !in_array($requiredRole, $roles, true))
+            {
+                throw new ProcessingException('The evaluator claimed '.$result['evidence_basis'].' evidence without a matching '.$requiredRole.' transcript reference. No score was saved.');
             }
         }
 

@@ -14,32 +14,16 @@ final class ReconciliationInput
         private WindowPrompt $prompts,
         private OllamaChatClient $client,
         private OllamaRequestBudget $budget,
+        private ReconciliationPrompt $compact,
     ) {
     }
 
     public function build(array $criterion, array $windowFindings, array $segments, array $context, int $contextTokens): array
     {
-        $this->input->criteria([$criterion]);
-        $originals = $this->input->spans($segments);
-        $source = [];
-        $lengths = [];
-
-        foreach ($originals as $segment)
-        {
-            if ($segment['text_start'] !== 0 || $segment['text_end'] !== strlen($segment['text']) || isset($lengths[$segment['id']]))
-            {
-                throw new ProcessingException('Whole-call reconciliation requires each complete original segment exactly once.');
-            }
-
-            $lengths[$segment['id']] = strlen($segment['text']);
-            $source[] = array_intersect_key($segment, array_flip(['id', 'start', 'end', 'text', 'speaker']));
-        }
-
-        $segmentIds = array_keys($lengths);
-        $this->validateExpectedSource($segmentIds, $lengths, $context);
-        [$findings, $derivedCoverage] = $this->findings($criterion['id'], $windowFindings, $segmentIds, $context);
-        $coverage = array_key_exists('window_coverage', $context) ? ($context['window_coverage'][$criterion['id']] ?? null) : $derivedCoverage;
-        $this->validateCoverage($coverage, $lengths);
+        $prepared = $this->prepare($criterion, $windowFindings, $segments, $context);
+        $source = $prepared['source'];
+        $findings = $prepared['findings'];
+        $lengths = $prepared['lengths'];
         $messages = $this->prompts->reconciliation($criterion, $findings, $source, $context, true, $contextTokens);
         $schema = $this->prompts->evaluationSchema($contextTokens);
 
@@ -81,18 +65,73 @@ final class ReconciliationInput
         $excerpts = array_values(array_filter($source, fn (array $segment) => isset($withNeighbors[$segment['id']])));
         $messages = $this->prompts->reconciliation($criterion, $findings, $excerpts, $context, false, $contextTokens);
 
-        if (!$this->budget->fits($this->client->request($messages, $schema, $contextTokens), $contextTokens))
+        if ($this->budget->fits($this->client->request($messages, $schema, $contextTokens), $contextTokens))
         {
-            throw new ContextLimitException('All observations and original supporting/contradictory context for criterion '.$criterion['id'].' cannot fit '.$contextTokens.' tokens. No evidence or transcript was discarded; checkpoints are preserved.');
+            return $this->package($messages, $schema, $excerpts, $findings, false, $lengths);
         }
 
-        return $this->package($messages, $schema, $excerpts, $findings, false, $lengths);
+        foreach ([[$source, true], [$excerpts, false]] as [$selected, $fullTranscript])
+        {
+            $messages = $this->compact->compact($criterion, $findings, $selected, $context, $fullTranscript, $contextTokens);
+
+            if ($this->budget->fits($this->client->request($messages, $schema, $contextTokens), $contextTokens))
+            {
+                return $this->package($messages, $schema, $selected, $findings, $fullTranscript, $lengths) + ['prompt_version' => ReconciliationPrompt::VERSION];
+            }
+        }
+
+        throw new ContextLimitException('Criterion '.$criterion['id'].' requires bounded reconciliation batches. Saved observations and the full transcript are preserved.');
+    }
+
+    public function prepare(array $criterion, array $windowFindings, array $segments, array $context): array
+    {
+        $this->input->criteria([$criterion]);
+        $originals = $this->input->spans($segments);
+        $source = [];
+        $lengths = [];
+
+        foreach ($originals as $segment)
+        {
+            if ($segment['text_start'] !== 0 || $segment['text_end'] !== strlen($segment['text']) || isset($lengths[$segment['id']]))
+            {
+                throw new ProcessingException('Whole-call reconciliation requires each complete original segment exactly once.');
+            }
+
+            $lengths[$segment['id']] = strlen($segment['text']);
+            $source[] = array_intersect_key($segment, array_flip(['id', 'start', 'end', 'text', 'speaker']));
+        }
+
+        $segmentIds = array_keys($lengths);
+        $this->validateExpectedSource($segmentIds, $lengths, $context);
+        [$findings, $derivedCoverage, $records] = $this->findings($criterion['id'], $windowFindings, $segmentIds, $context);
+        $coverage = array_key_exists('window_coverage', $context) ? ($context['window_coverage'][$criterion['id']] ?? null) : $derivedCoverage;
+        $this->validateCoverage($coverage, $lengths);
+
+        return compact('source', 'findings', 'lengths', 'coverage', 'records');
+    }
+
+    public function validateSourceCoverage(array $segments, array $coverage, array $context): void
+    {
+        $originals = $this->input->spans($segments);
+        $lengths = [];
+
+        foreach ($originals as $segment)
+        {
+            if ($segment['text_start'] !== 0 || isset($lengths[$segment['id']]))
+            {
+                throw new ProcessingException('Reconciliation requires unique complete original segments.');
+            }
+            $lengths[$segment['id']] = strlen($segment['text']);
+        }
+        $this->validateExpectedSource(array_keys($lengths), $lengths, $context);
+        $this->validateCoverage($coverage, $lengths);
     }
 
     private function findings(int $criterionId, array $windowFindings, array $segmentIds, array $context): array
     {
         $findings = [];
         $coverage = [];
+        $records = [];
 
         foreach ($windowFindings as $record)
         {
@@ -144,6 +183,7 @@ final class ReconciliationInput
             }
 
             $findings[] = $validated[0];
+            $records[] = ['observation' => $validated[0], 'metadata' => $metadata];
         }
 
         if ($findings === [])
@@ -151,7 +191,7 @@ final class ReconciliationInput
             throw new ProcessingException('Whole-call reconciliation requires saved observations for this criterion.');
         }
 
-        return [$findings, $coverage];
+        return [$findings, $coverage, $records];
     }
 
     private function validateExpectedSource(array $ids, array $lengths, array $context): void

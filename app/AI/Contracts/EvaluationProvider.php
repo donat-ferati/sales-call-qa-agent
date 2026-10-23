@@ -3,13 +3,25 @@
 namespace App\AI\Contracts;
 
 use App\AI\Data\EvaluationResult;
+use App\AI\Data\WindowResult;
 
+/** Evaluates immutable call snapshots through individually persisted, bounded steps. */
 interface EvaluationProvider
 {
-    /**
-     * @param  array<int, array<string, mixed>>  $criteria  Published criteria, including id and pass_standard.
-     * @param  array<int, array<string, mixed>>  $segments  Persisted same-call segments, including id, start, end, text, and nullable speaker.
-     * @param  array<string, mixed>  $context  Call completeness and reliable speaker context, when known.
-     */
-    public function evaluate(array $criteria, array $segments, array $context = []): EvaluationResult;
+    public function modelDigest(): string;
+
+    /** @return array<int, array<string, mixed>> Serializable window plans referencing original byte ranges. */
+    public function plan(array $criteria, array $segments, array $context, int $contextTokens): array;
+
+    public function inspect(array $criteria, array $spans, array $context, int $contextTokens): WindowResult;
+
+    public function reconciliationNodes(array $criterion, array $windowFindings, array $segments, array $context): array;
+
+    public function planReconciliation(array $criterion, array $nodes, array $segments, array $context, int $contextTokens): array;
+
+    public function reduce(array $criterion, array $nodes, array $segments, array $context, int $contextTokens): WindowResult;
+
+    public function nodeFromReduction(WindowResult|array $output): array;
+
+    public function reconcileNodes(array $criterion, array $nodes, array $segments, array $context, int $contextTokens): EvaluationResult;
 }

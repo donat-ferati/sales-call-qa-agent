@@ -2,12 +2,13 @@
 
 namespace App\AI;
 
+use App\AI\Contracts\EvaluationProvider;
 use App\AI\Data\EvaluationResult;
 use App\AI\Data\WindowResult;
 use App\AI\Exceptions\ContextLimitException;
 use App\AI\Exceptions\ProcessingException;
 
-final class WindowedEvaluator
+final class WindowedEvaluator implements EvaluationProvider
 {
     public function __construct(
         private OllamaChatClient $client,
@@ -17,6 +18,7 @@ final class WindowedEvaluator
         private WindowResponseValidator $windowValidator,
         private EvaluationResponseValidator $evaluationValidator,
         private ReconciliationInput $reconciliation,
+        private ReconciliationReducer $reducer,
     ) {
     }
 
@@ -55,13 +57,54 @@ final class WindowedEvaluator
     public function reconcile(array $criterion, array $windowFindings, array $segments, array $context, int $contextTokens): EvaluationResult
     {
         $input = $this->reconciliation->build($criterion, $windowFindings, $segments, $context, $contextTokens);
-        $response = $this->client->complete($input['messages'], $input['schema'], $contextTokens, WindowPrompt::RECONCILE_VERSION, $context['model_digest'] ?? null);
-        $results = $this->evaluationValidator->validate($response->payload, [$criterion['id']], $input['segment_ids']);
+        $response = $this->client->complete($input['messages'], $input['schema'], $contextTokens, $input['prompt_version'] ?? WindowPrompt::RECONCILE_VERSION, $context['model_digest'] ?? null);
+
+        return $this->wholeCallResult($criterion, $response->payload, $response->metadata, $input, $context);
+    }
+
+    public function reconciliationNodes(array $criterion, array $windowFindings, array $segments, array $context): array
+    {
+        return $this->reducer->leaves($criterion, $windowFindings, $segments, $context);
+    }
+
+    public function planReconciliation(array $criterion, array $nodes, array $segments, array $context, int $contextTokens): array
+    {
+        return $this->reducer->plan($criterion, $nodes, $segments, $context, $contextTokens);
+    }
+
+    public function reduce(array $criterion, array $nodes, array $segments, array $context, int $contextTokens): WindowResult
+    {
+        return $this->reducer->reduce($criterion, $nodes, $segments, $context, $contextTokens);
+    }
+
+    public function nodeFromReduction(WindowResult|array $output): array
+    {
+        return $this->reducer->nodeFromReduction($output);
+    }
+
+    public function reconcileNodes(array $criterion, array $nodes, array $segments, array $context, int $contextTokens): EvaluationResult
+    {
+        $input = $this->reducer->finalInput($criterion, $nodes, $segments, $context, $contextTokens);
+        $response = $this->client->complete($input['messages'], $input['schema'], $contextTokens, $input['prompt_version'] ?? WindowPrompt::RECONCILE_VERSION, $context['model_digest'] ?? null);
+
+        return $this->wholeCallResult($criterion, $response->payload, $response->metadata, $input, $context);
+    }
+
+    private function wholeCallResult(array $criterion, array $payload, array $metadata, array $input, array $context): EvaluationResult
+    {
+        $results = $this->evaluationValidator->validate($payload, [$criterion['id']], $input['segment_ids']);
         $result = $results[0];
 
         if ($result['evidence_basis'] === 'missing' && in_array($result['decision'], ['PASS', 'FAIL'], true) && ($context['is_complete'] ?? null) !== true)
         {
             throw new ProcessingException('A recording that is incomplete or has unknown completeness cannot prove a whole-call omission. No judgment was saved.');
+        }
+
+        $flags = $input['metadata']['flags'] ?? null;
+
+        if ($flags !== null && $result['evidence_basis'] === 'missing' && in_array($result['decision'], ['PASS', 'FAIL'], true) && ($flags['uncertain'] || $flags['needs_context'] || in_array('unknown', $flags['applicability'], true)))
+        {
+            throw new ProcessingException('Unresolved original uncertainty or attribution cannot establish a whole-call omission. No judgment was saved.');
         }
 
         $seen = [];
@@ -78,7 +121,7 @@ final class WindowedEvaluator
             $seen[$key] = true;
         }
 
-        return new EvaluationResult($results, $response->metadata + $input['metadata'] + ['scope' => 'whole_call_reconciliation']);
+        return new EvaluationResult($results, $metadata + $input['metadata'] + ['scope' => 'whole_call_reconciliation']);
     }
 
     public function fitsReconciliation(array $criterion, array $windowFindings, array $segments, array $context, int $contextTokens): bool

@@ -9,6 +9,7 @@ use App\AI\Exceptions\TransientEvaluationException;
 use Illuminate\Contracts\Config\Repository;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Factory;
+use Illuminate\Http\Client\PendingRequest;
 use JsonException;
 
 final class OllamaChatClient
@@ -24,7 +25,7 @@ final class OllamaChatClient
     {
         try
         {
-            $response = $this->http->connectTimeout($this->config->get('qa.ollama.connect_timeout'))->timeout(15)->get($this->baseUrl().'/api/tags');
+            $response = $this->localRequest(15)->get($this->baseUrl().'/api/tags');
         }
         catch (ConnectionException)
         {
@@ -89,8 +90,7 @@ final class OllamaChatClient
 
         try
         {
-            $response = $this->http->connectTimeout($this->config->get('qa.ollama.connect_timeout'))
-                ->timeout($this->config->get('qa.ollama.timeout'))->post($this->baseUrl().'/api/chat', $request);
+            $response = $this->localRequest($this->config->get('qa.ollama.timeout'))->post($this->baseUrl().'/api/chat', $request);
         }
         catch (ConnectionException)
         {
@@ -157,13 +157,27 @@ final class OllamaChatClient
         ]);
     }
 
+    private function localRequest(int $timeout): PendingRequest
+    {
+        // Neither redirects nor environment proxy settings may send local recording data elsewhere.
+        return $this->http->withoutRedirecting()->withOptions(['proxy' => ''])
+            ->connectTimeout($this->config->get('qa.ollama.connect_timeout'))->timeout($timeout);
+    }
+
     private function baseUrl(): string
     {
-        $baseUrl = rtrim($this->config->get('qa.ollama.url'), '/');
+        $configured = $this->config->get('qa.ollama.url');
 
-        if (!in_array(parse_url($baseUrl, PHP_URL_HOST), ['127.0.0.1', 'localhost', '[::1]', '::1'], true))
+        if (!is_string($configured))
         {
-            throw new ProcessingException('The evaluator must use a local loopback Ollama address. Recording processing is local only.');
+            throw new ProcessingException('The evaluator must use a local loopback Ollama HTTP address. Recording processing is local only.');
+        }
+        $baseUrl = rtrim($configured, '/');
+        $parts = parse_url($baseUrl);
+
+        if (!is_array($parts) || !in_array($parts['scheme'] ?? null, ['http', 'https'], true) || !in_array($parts['host'] ?? null, ['127.0.0.1', 'localhost', '[::1]', '::1'], true))
+        {
+            throw new ProcessingException('The evaluator must use a local loopback Ollama HTTP address. Recording processing is local only.');
         }
 
         return $baseUrl;

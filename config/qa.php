@@ -1,11 +1,11 @@
 <?php
 
-use App\AI\Providers\OllamaEvaluationProvider;
 use App\AI\Providers\WhisperCppTranscriptionProvider;
+use App\AI\WindowedEvaluator;
 
 return [
     'transcription_provider' => WhisperCppTranscriptionProvider::class,
-    'evaluation_provider' => OllamaEvaluationProvider::class,
+    'evaluation_provider' => WindowedEvaluator::class,
     'bulk' => [
         'max_sources' => 20,
         'max_source_kilobytes' => 102400,
@@ -46,6 +46,10 @@ return [
         'top_p' => 0.8,
         'top_k' => 20,
         'min_p' => 0,
+    ],
+    'processing' => [
+        'cleanup_max_directories' => 100,
+        'cleanup_grace_seconds' => 600,
     ],
     'retention_days' => env('QA_RETENTION_DAYS') === null ? null : (int) env('QA_RETENTION_DAYS'),
 ];
