@@ -1,0 +1,19 @@
+{
+    "preset": "laravel",
+    "rules": {
+        "braces_position": {
+            "classes_opening_brace": "next_line_unless_newline_at_signature_end",
+            "functions_opening_brace": "next_line_unless_newline_at_signature_end",
+            "control_structures_opening_brace": "next_line_unless_newline_at_signature_end",
+            "anonymous_functions_opening_brace": "next_line_unless_newline_at_signature_end",
+            "anonymous_classes_opening_brace": "next_line_unless_newline_at_signature_end",
+            "allow_single_line_empty_anonymous_classes": true,
+            "allow_single_line_anonymous_functions": true
+        },
+        "new_with_parentheses": true,
+        "not_operator_with_successor_space": false,
+        "single_space_around_construct": false,
+        "single_line_empty_body": false,
+        "control_structure_continuation_position": {"position": "next_line"}
+    }
+}
