@@ -38,16 +38,18 @@
     },
     "scripts": {
         "setup": [
-            "composer install",
             "@php -r \"file_exists('.env') || copy('.env.example', '.env');\"",
-            "@php artisan key:generate",
-            "@php artisan migrate --force",
-            "npm install",
+            "composer install",
+            "@php artisan config:clear",
+            "powershell -NoProfile -Command \"if (Select-String -LiteralPath '.env' -Pattern '^APP_KEY=\\s*$' -Quiet) { php artisan key:generate; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }\"",
+            "@php artisan migrate --seed --force",
+            "npm ci",
             "npm run build"
         ],
         "dev": [
             "Composer\\Config::disableProcessTimeout",
-            "npx concurrently \"php artisan serve --host=127.0.0.1 --port=8015\" \"php artisan queue:work --queue=audio --tries=3 --sleep=2 --timeout=0\" \"npm run dev\" --names=server,queue,vite --kill-others"
+            "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-local.ps1",
+            "npm run dev"
         ],
         "test": [
             "@php artisan config:clear --ansi",
