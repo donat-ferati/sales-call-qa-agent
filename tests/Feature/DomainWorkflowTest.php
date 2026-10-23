@@ -11,7 +11,6 @@ use App\Actions\PublishTemplate;
 use App\Actions\RecalculateEvaluation;
 use App\Actions\RetryEvaluation;
 use App\Actions\SaveTemplate;
-use App\AI\Contracts\EvaluationProvider;
 use App\AI\Contracts\TranscriptionProvider;
 use App\AI\Data\EvaluationResult;
 use App\AI\Data\TranscriptionResult;
@@ -27,6 +26,8 @@ use App\Models\TranscriptSegment;
 use App\Models\User;
 use App\Services\ProcessingAttempt;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\Client\Request;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
@@ -246,12 +247,13 @@ final class DomainWorkflowTest extends TestCase
         $evaluation = $this->evaluation($this->publishedTemplate()->currentVersion, 'completed');
         $this->criterionResult($evaluation, 'PASS');
         $transcriber = Mockery::mock(TranscriptionProvider::class)->shouldNotReceive('transcribe')->getMock();
-        $evaluator = Mockery::mock(EvaluationProvider::class)->shouldNotReceive('evaluate')->getMock();
+        Http::preventStrayRequests();
+        Http::fake();
         $this->app->instance(TranscriptionProvider::class, $transcriber);
-        $this->app->instance(EvaluationProvider::class, $evaluator);
         $this->app->call([new TranscribeCall($evaluation->id), 'handle']);
         $this->app->call([new EvaluateCall($evaluation->id), 'handle']);
 
+        Http::assertNothingSent();
         $this->assertSame(1, $evaluation->results()->count());
         $this->assertSame('completed', $evaluation->fresh()->status);
     }
@@ -289,22 +291,58 @@ final class DomainWorkflowTest extends TestCase
 
     public function test_evaluation_job_passes_persisted_evidence_and_call_completeness_to_provider(): void
     {
+        Queue::fake();
         $version = $this->publishedTemplate()->currentVersion;
         $evaluation = $this->evaluation($version);
         $evaluation->call->update(['is_complete' => false]);
         $segment = $this->segment($evaluation);
-        $evaluator = Mockery::mock(EvaluationProvider::class);
-        $evaluator->shouldReceive('evaluate')->once()->withArgs(fn ($criteria, $segments, $context) => $criteria[0]['id'] === $version->criteria()->firstOrFail()->id
-            && $segments[0]['id'] === $segment->id
-            && $context['is_complete'] === false
-        )->andReturn($this->assessment($version, 'INSUFFICIENT_EVIDENCE'));
-        $this->app->instance(EvaluationProvider::class, $evaluator);
-        $this->app->call([new EvaluateCall($evaluation->id), 'handle']);
+        $this->fakeOllama(function (Request $request)
+        {
+            $data = json_decode($request['messages'][1]['content'], true, flags: JSON_THROW_ON_ERROR);
+            $criterionId = $data['criteria'][0]['id'];
 
+            if (isset($request['format']['properties']['observations']))
+            {
+                $payload = ['observations' => [[
+                    'criterion_id' => $criterionId, 'status' => 'uncertain', 'evidence' => [],
+                    'explanation' => 'The available recording does not establish a complete introduction.',
+                    'uncertainty' => 'The recording is incomplete.', 'needs_context' => true, 'applicability' => 'unknown',
+                ]]];
+            }
+            else
+            {
+                $payload = ['results' => [[
+                    'criterion_id' => $criterionId, 'decision' => 'INSUFFICIENT_EVIDENCE',
+                    'explanation' => 'The incomplete recording cannot establish the standard.',
+                    'evidence' => [], 'evidence_basis' => 'uncertain', 'uncertainty' => 'Missing call context.',
+                ]]];
+            }
+
+            return Http::response(['done' => true, 'done_reason' => 'stop', 'message' => ['content' => json_encode($payload, JSON_THROW_ON_ERROR)]]);
+        });
+
+        for ($step = 0; $step < 3; $step++)
+        {
+            $this->app->call([new EvaluateCall($evaluation->id), 'handle']);
+        }
+
+        Http::assertSent(function (Request $request) use ($version, $segment)
+        {
+            if (!str_ends_with($request->url(), '/api/chat'))
+            {
+                return false;
+            }
+            $data = json_decode($request['messages'][1]['content'], true, flags: JSON_THROW_ON_ERROR);
+
+            return isset($data['spans']) && $data['criteria'][0]['id'] === $version->criteria()->firstOrFail()->id
+                && $data['spans'][0]['id'] === $segment->id && $data['recording']['is_complete'] === false;
+        });
         $this->assertSame('completed', $evaluation->fresh()->status);
         $this->assertNull($evaluation->fresh()->ai_score);
         $this->assertSame('0.00', $evaluation->fresh()->ai_coverage);
         $this->assertSame('INSUFFICIENT_EVIDENCE', $evaluation->results()->firstOrFail()->ai_decision);
+        $this->assertDatabaseHas('evaluation_steps', ['kind' => 'window', 'status' => 'completed']);
+        $this->assertDatabaseHas('evaluation_steps', ['kind' => 'reconcile', 'status' => 'completed']);
     }
 
     public function test_active_attempt_claims_prevent_duplicate_processing_and_stale_failures(): void
@@ -327,26 +365,31 @@ final class DomainWorkflowTest extends TestCase
         Queue::fake();
         $evaluation = $this->evaluation($this->publishedTemplate()->currentVersion);
         $segment = $this->segment($evaluation);
-        $evaluator = Mockery::mock(EvaluationProvider::class);
-        $evaluator->shouldReceive('evaluate')->once()->andThrow(new RuntimeException('Provider-specific failure.'));
-        $this->app->instance(EvaluationProvider::class, $evaluator);
+        $this->fakeOllama(fn () => Http::response([
+            'done' => true, 'done_reason' => 'stop', 'message' => ['content' => 'This is not structured JSON.'],
+        ]));
 
-        try
-        {
-            $this->app->call([new EvaluateCall($evaluation->id), 'handle']);
-            $this->fail('The failed provider was reported as completed.');
-        }
-        catch (RuntimeException $exception)
-        {
-            $this->assertStringContainsString('Evaluation failed', $exception->getMessage());
-        }
+        $this->app->call([new EvaluateCall($evaluation->id), 'handle']);
+
         $this->assertSame('failed', $evaluation->fresh()->status);
+        $this->assertStringContainsString('malformed JSON', $evaluation->fresh()->error_message);
         $this->assertDatabaseHas('transcript_segments', ['id' => $segment->id]);
+        $this->assertDatabaseHas('evaluation_steps', ['kind' => 'window', 'status' => 'failed', 'attempts' => 1]);
         $this->assertDatabaseCount('criterion_results', 0);
         app(RetryEvaluation::class)->handle($evaluation->fresh());
         $this->assertSame('queued', $evaluation->fresh()->status);
         $this->assertSame('transcript_ready', $evaluation->call->fresh()->status);
         Queue::assertPushed(EvaluateCall::class, fn ($job) => $job->evaluationId === $evaluation->id);
+    }
+
+    private function fakeOllama(callable $chat): void
+    {
+        Http::preventStrayRequests();
+        $url = rtrim(config('qa.ollama.url'), '/');
+        Http::fake([
+            $url.'/api/tags' => Http::response(['models' => [['name' => config('qa.ollama.model'), 'digest' => str_repeat('a', 64)]]]),
+            $url.'/api/chat' => $chat,
+        ]);
     }
 
     private function templateData(string $title = 'Greeting'): array

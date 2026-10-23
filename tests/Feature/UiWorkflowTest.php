@@ -4,6 +4,8 @@ namespace Tests\Feature;
 
 use App\Actions\PublishTemplate;
 use App\Actions\SaveTemplate;
+use App\Jobs\PrepareCallUploadBatch;
+use App\Jobs\TranscribeCall;
 use App\Livewire\Calls\Create as UploadCallPage;
 use App\Livewire\Evaluations\Show as EvaluationPage;
 use App\Livewire\Templates\Create as CreateTemplatePage;
@@ -11,6 +13,7 @@ use App\Livewire\Templates\Edit as EditTemplatePage;
 use App\Livewire\Templates\Index as TemplateIndex;
 use App\Livewire\Templates\Show as TemplatePage;
 use App\Models\CallRecording;
+use App\Models\CallUploadBatch;
 use App\Models\CriterionEvidence;
 use App\Models\CriterionResult;
 use App\Models\Evaluation;
@@ -27,6 +30,12 @@ use Tests\TestCase;
 class UiWorkflowTest extends TestCase
 {
     use RefreshDatabase;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $this->withoutVite();
+    }
 
     public function test_guest_access_requires_authentication(): void
     {
@@ -83,31 +92,45 @@ class UiWorkflowTest extends TestCase
         $this->get(route('evaluations.show', $evaluation))->assertOk()->assertSee('Greeting standard');
     }
 
-    public function test_upload_validates_content_and_queues_a_real_file_without_running_ai(): void
+    public function test_upload_preparation_rejects_corrupt_audio_and_queues_valid_recordings_without_ai(): void
     {
         Storage::fake('local');
         Queue::fake();
         config(['qa.audio.ffprobe' => __FILE__]);
-        Process::fake(['*' => Process::result(errorOutput: 'Invalid audio stream.', exitCode: 1)]);
-        $manager = User::factory()->create(['role' => 'manager']);
-        $this->actingAs($manager);
-        $template = $this->publishedTemplate($manager);
-        $this->get(route('calls.create'))->assertOk()->assertSee('wire:submit="uploadRecording"', false)->assertDontSee('wire:submit="upload"', false);
-
-        Livewire::test(UploadCallPage::class)->set('templateId', $template->id)
-            ->set('audio', UploadedFile::fake()->createWithContent('not-audio.wav', 'This is not audio.'))
-            ->call('uploadRecording')->assertHasErrors(['audio']);
-        $this->assertDatabaseCount('call_recordings', 0);
-
         Process::fake([
             '*' => Process::result(output: json_encode(['streams' => [['codec_name' => 'pcm_s16le', 'channels' => 1]], 'format' => ['duration' => '10.0', 'format_name' => 'wav']])),
         ]);
-        $audio = UploadedFile::fake()->createWithContent('recording.wav', $this->waveFile());
-        Livewire::test(UploadCallPage::class)->set('templateId', $template->id)->set('audio', $audio)
-            ->call('uploadRecording')->assertHasNoErrors();
+        $manager = User::factory()->create(['role' => 'manager']);
+        $this->actingAs($manager);
+        $template = $this->publishedTemplate($manager);
+        $this->get(route('calls.create'))->assertOk()->assertSee('wire:submit="submitBatch"', false);
+
+        Livewire::test(UploadCallPage::class)->set('templateId', $template->id)
+            ->call('submitBatch')->assertHasErrors(['sources']);
+        $this->assertDatabaseCount('call_upload_batches', 0);
+
+        Livewire::test(UploadCallPage::class)->set('templateId', $template->id)
+            ->set('sources', [
+                UploadedFile::fake()->createWithContent('not-audio.wav', 'This is not audio.'),
+                UploadedFile::fake()->createWithContent('recording.wav', $this->waveFile()),
+            ])
+            ->call('submitBatch')->assertHasNoErrors();
+        $batch = CallUploadBatch::firstOrFail();
+        Queue::assertPushed(PrepareCallUploadBatch::class, fn ($job) => $job->batchId === $batch->id && $job->queue === 'imports');
+        $this->assertDatabaseCount('call_recordings', 0);
+
+        $this->app->call([new PrepareCallUploadBatch($batch->id), 'handle']);
+
+        $this->assertSame('prepared', $batch->fresh()->status);
+        $this->assertDatabaseHas('call_upload_items', ['call_upload_batch_id' => $batch->id, 'original_name' => 'not-audio.wav', 'status' => 'rejected']);
+        $this->assertDatabaseCount('call_recordings', 1);
         $call = CallRecording::firstOrFail();
+        $this->assertSame('recording.wav', $call->original_filename);
         Storage::disk('local')->assertExists($call->path);
-        $this->assertSame('queued', $call->evaluations->first()->status);
+        $evaluation = $call->evaluations()->firstOrFail();
+        $this->assertSame('queued', $evaluation->status);
+        $this->assertSame($template->current_version_id, $evaluation->template_version_id);
+        Queue::assertPushed(TranscribeCall::class, fn ($job) => $job->evaluationId === $evaluation->id && $job->queue === 'audio');
     }
 
     public function test_audio_stream_supports_range_and_rejects_unauthorized_access(): void
@@ -143,6 +166,74 @@ class UiWorkflowTest extends TestCase
         $this->assertDatabaseCount('score_overrides', 1);
         $page->call('markReviewed')->assertHasNoErrors();
         $this->assertSame('reviewed', $evaluation->refresh()->review_status);
+    }
+
+    public function test_historical_version_selection_shows_its_saved_contents_and_is_read_only(): void
+    {
+        $manager = User::factory()->create(['role' => 'manager']);
+        $this->actingAs($manager);
+        $template = $this->publishedTemplate($manager);
+        $originalVersion = $template->currentVersion;
+        $changes = $this->templateData();
+        $changes['name'] = 'A newer draft name';
+        $changes['description'] = 'New draft description.';
+        $changes['criteria'][0]['title'] = 'New draft criterion';
+        app(SaveTemplate::class)->handle($manager, $changes, $template);
+
+        $this->get(route('templates.show', ['template' => $template->id, 'version' => $originalVersion->id]))
+            ->assertOk()->assertSee('Conversation fundamentals')->assertSee('Greeting standard')
+            ->assertSee('Illustrative test rubric.')->assertDontSee('New draft criterion')
+            ->assertDontSee('A newer draft name')->assertSee('Read-only historical version.')
+            ->assertSee('aria-current="page"', false)->assertDontSee('wire:click="publish"', false)
+            ->assertDontSee('Edit draft');
+
+        $page = Livewire::withQueryParams(['version' => $originalVersion->id])
+            ->test(TemplatePage::class, ['template' => $template]);
+        $page->call('publish')->assertHasErrors(['version']);
+        $page->call('duplicate')->assertHasErrors(['version']);
+        $this->assertDatabaseCount('qa_templates', 1);
+        $this->assertSame($originalVersion->id, $template->fresh()->current_version_id);
+        $this->assertNull($template->versions()->where('number', 2)->firstOrFail()->published_at);
+    }
+
+    public function test_version_selection_is_scoped_to_the_authorized_template(): void
+    {
+        $manager = User::factory()->create(['role' => 'manager']);
+        $this->actingAs($manager);
+        $template = $this->publishedTemplate($manager);
+        $other = $this->publishedTemplate($manager);
+
+        $this->get(route('templates.show', ['template' => $template->id, 'version' => $other->current_version_id]))->assertNotFound();
+        $this->get(route('templates.show', ['template' => $template->id, 'version' => 'invalid']))->assertNotFound();
+        $this->actingAs(User::factory()->create(['role' => 'viewer']))
+            ->get(route('templates.show', ['template' => $template->id, 'version' => $template->current_version_id]))->assertForbidden();
+    }
+
+    public function test_stale_preview_cannot_publish_a_different_draft(): void
+    {
+        $manager = User::factory()->create(['role' => 'manager']);
+        $this->actingAs($manager);
+        $template = $this->publishedTemplate($manager);
+        $originalVersion = $template->current_version_id;
+        $page = Livewire::test(TemplatePage::class, ['template' => $template]);
+        app(SaveTemplate::class)->handle($manager, $this->templateData(), $template);
+
+        $page->call('publish')->assertHasErrors(['version']);
+
+        $this->assertSame($originalVersion, $template->fresh()->current_version_id);
+        $this->assertNull($template->versions()->where('number', 2)->firstOrFail()->published_at);
+    }
+
+    public function test_dashboard_scores_and_provisional_coverage_keep_two_decimal_places(): void
+    {
+        $manager = User::factory()->create(['role' => 'manager']);
+        $this->actingAs($manager);
+        $evaluation = $this->evaluation($manager, $this->publishedTemplate($manager));
+        $evaluation->update(['final_score' => 99.95, 'review_status' => 'reviewed']);
+
+        $this->get(route('dashboard'))->assertOk()->assertSee('99.95%')->assertDontSee('100.0%');
+        $this->blade('<x:score label="Current review score" :provisional="66.67" :coverage="99.95" />')
+            ->assertSee('99.95% weight resolved')->assertDontSee('100% weight resolved');
     }
 
     private function publishedTemplate(User $user): QaTemplate

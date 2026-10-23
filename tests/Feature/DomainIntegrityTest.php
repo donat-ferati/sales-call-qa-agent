@@ -212,6 +212,7 @@ final class DomainIntegrityTest extends TestCase
         $localFiles = Storage::disk('local');
         $disk = Mockery::mock(FilesystemAdapter::class);
         $disk->shouldReceive('delete')->once()->with($evaluation->call->path)->andReturn(false);
+        $disk->shouldReceive('path')->with('processing')->andReturn($localFiles->path('processing'));
         Storage::shouldReceive('disk')->with('local')->andReturn($disk);
         $this->artisan('qa:prune', ['--execute' => true])
             ->expectsOutputToContain('was not pruned')
